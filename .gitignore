@@ -1,0 +1,15 @@
+node_modules/
+dist/
+build/
+coverage/
+.env
+.env.*
+!.env.example
+workbench/
+workbench-synced-edits.json
+.local-repo-drafts/
+.aistudio/
+metadata.json
+/tmp/
+*.log
+.DS_Store
