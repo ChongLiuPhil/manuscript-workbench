@@ -1,24 +1,104 @@
-import { execFileSync } from 'child_process';
+import { execFile, execFileSync } from 'child_process';
 import crypto from 'crypto';
 import dotenv from 'dotenv';
 import express from 'express';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
+import { canSafelyDeleteOrRecloneRepo, canSafelyFastForwardBase } from './src/utils/repoGuard.ts';
 
 dotenv.config();
 
-const TARGET_REPO_DIR = '/tmp/target-repo';
-const CONFIG_FILE = '/tmp/manuscript-workbench-config.json';
-const STATE_FILE = '/tmp/manuscript-workbench-state.json';
+const WORKBENCH_DATA_DIR = path.resolve(
+  (process.env.WORKBENCH_DATA_DIR || '').trim() || path.join(process.cwd(), '.workbench-data')
+);
+// Keep cloned target repo outside the app workspace by default so cloud IDE / snapshot syncs
+// never overwrite or delete its .git metadata or working-tree files.
+const TARGET_REPO_DIR = path.resolve(
+  (process.env.WORKBENCH_REPO_DIR || '').trim() || path.join(os.tmpdir(), 'manuscript-workbench-repo')
+);
+const CONFIG_FILE = path.join(WORKBENCH_DATA_DIR, 'config.json');
+const STATE_FILE = path.join(WORKBENCH_DATA_DIR, 'state.json');
+const LEGACY_WORKSPACE_REPO_DIR = path.join(WORKBENCH_DATA_DIR, 'target-repo');
+const LEGACY_TMP_REPO_DIR = '/tmp/target-repo';
+const LEGACY_TMP_CONFIG_FILE = '/tmp/manuscript-workbench-config.json';
+const LEGACY_TMP_STATE_FILE = '/tmp/manuscript-workbench-state.json';
 const WORKFLOW_MD_FILE = path.resolve(process.cwd(), 'WORKFLOW_INSTRUCTIONS.md');
 const DEFAULT_BASE_BRANCH = 'main';
 const REPO_SLUG_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const SAFE_REF_RE = /^[A-Za-z0-9_./@^~-]+$/;
 
+function atomicWriteFileSync(filePath: string, content: string): void {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const tmpPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  fs.writeFileSync(tmpPath, content, 'utf-8');
+  fs.renameSync(tmpPath, filePath);
+}
+
+function migrateLegacyTmpWorkspaceIfNeeded(): void {
+  try {
+    fs.mkdirSync(WORKBENCH_DATA_DIR, { recursive: true });
+    if (!fs.existsSync(CONFIG_FILE) && fs.existsSync(LEGACY_TMP_CONFIG_FILE)) {
+      fs.copyFileSync(LEGACY_TMP_CONFIG_FILE, CONFIG_FILE);
+    }
+    if (!fs.existsSync(STATE_FILE) && fs.existsSync(LEGACY_TMP_STATE_FILE)) {
+      fs.copyFileSync(LEGACY_TMP_STATE_FILE, STATE_FILE);
+    }
+    if (!fs.existsSync(TARGET_REPO_DIR)) {
+      const legacySource =
+        LEGACY_WORKSPACE_REPO_DIR !== TARGET_REPO_DIR &&
+        fs.existsSync(path.join(LEGACY_WORKSPACE_REPO_DIR, '.git'))
+          ? LEGACY_WORKSPACE_REPO_DIR
+          : LEGACY_TMP_REPO_DIR !== TARGET_REPO_DIR &&
+              fs.existsSync(path.join(LEGACY_TMP_REPO_DIR, '.git'))
+            ? LEGACY_TMP_REPO_DIR
+            : null;
+      if (legacySource) {
+        fs.mkdirSync(path.dirname(TARGET_REPO_DIR), { recursive: true });
+        fs.cpSync(legacySource, TARGET_REPO_DIR, { recursive: true });
+      }
+    }
+  } catch (err) {
+    console.warn('Legacy workspace migration warning:', String(err));
+  }
+}
+
 interface RuntimeConfig {
   repoSlug: string;
   defaultBase: string;
+}
+
+const autoMountState: {
+  inProgress: boolean;
+  error: string | null;
+  attemptedAt: number;
+} = {
+  inProgress: false,
+  error: null,
+  attemptedAt: 0,
+};
+
+function computeWorktreeDigest(dirtyLines: string[]): string {
+  if (dirtyLines.length === 0) return '';
+  const parts: string[] = [];
+  for (const rawLine of dirtyLines) {
+    const body = rawLine.slice(2).trim();
+    const relPath = body.includes(' -> ') ? body.split(' -> ').pop()!.trim() : body;
+    const unquoted = relPath.replace(/^"|"$/g, '');
+    const full = safeResolveRepoPath(unquoted);
+    if (full && fs.existsSync(full)) {
+      try {
+        const st = fs.statSync(full);
+        parts.push(`${rawLine}:${st.size}:${Math.floor(st.mtimeMs)}`);
+        continue;
+      } catch {
+        // fall back to raw status line
+      }
+    }
+    parts.push(`${rawLine}:missing`);
+  }
+  return sha256Text(parts.join('\n'));
 }
 
 interface BilingualPairInfo {
@@ -51,7 +131,7 @@ interface FileDiffRaw {
 }
 
 function getGithubToken(): string {
-  return (process.env.GITHUB_TOKEN || '').trim();
+  return (process.env.GITHUB_TOKEN || process.env.GH_TOKEN || '').trim();
 }
 
 function getGitAuthArgs(): string[] {
@@ -71,13 +151,16 @@ function loadConfig(): RuntimeConfig {
       fileCfg = {};
     }
   }
-  const repoSlug = (fileCfg.repoSlug || (REPO_SLUG_RE.test(envRepo) ? envRepo : '') || '').trim();
+  const repoSlug = (
+    fileCfg.repoSlug ||
+    (REPO_SLUG_RE.test(envRepo) ? envRepo : '')
+  ).trim();
   const defaultBase = (fileCfg.defaultBase || DEFAULT_BASE_BRANCH).trim() || DEFAULT_BASE_BRANCH;
   return { repoSlug, defaultBase };
 }
 
 function saveConfig(cfg: RuntimeConfig): void {
-  fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2), 'utf-8');
+  atomicWriteFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2));
 }
 
 function isRepoCloned(): boolean {
@@ -432,6 +515,9 @@ function getRepoStatusPayload() {
       hasLocalDraftEdits: false,
       dirtyCount: 0,
       dirtyFiles: [],
+      worktreeDigest: '',
+      autoMounting: autoMountState.inProgress,
+      autoMountError: autoMountState.error,
       recentCommits: [],
       branches: [],
       hasCustomDashboard: false,
@@ -519,6 +605,9 @@ function getRepoStatusPayload() {
     hasLocalDraftEdits: dirtyFiles.length > 0,
     dirtyCount: dirtyFiles.length,
     dirtyFiles,
+    worktreeDigest: computeWorktreeDigest(dirtyFiles),
+    autoMounting: false,
+    autoMountError: null,
     recentCommits,
     branches: Array.from(branchSet),
     hasCustomDashboard: Boolean(dashboardPath),
@@ -738,16 +827,61 @@ function lintGenericManuscript(text: string, relPath: string) {
 }
 
 function autoMountFromEnvIfNeeded() {
+  migrateLegacyTmpWorkspaceIfNeeded();
   const cfg = loadConfig();
-  if (!isRepoCloned() && cfg.repoSlug && REPO_SLUG_RE.test(cfg.repoSlug)) {
+  if (isRepoCloned() || autoMountState.inProgress) return;
+  if (!cfg.repoSlug || !REPO_SLUG_RE.test(cfg.repoSlug)) return;
+
+  // Never delete a non-empty TARGET_REPO_DIR automatically: protect local files unconditionally.
+  if (fs.existsSync(TARGET_REPO_DIR)) {
     try {
-      const cleanUrl = `https://github.com/${cfg.repoSlug}.git`;
-      fs.mkdirSync(path.dirname(TARGET_REPO_DIR), { recursive: true });
-      runGit(['clone', cleanUrl, TARGET_REPO_DIR], { auth: true, cwd: '/tmp' });
-    } catch {
-      // Allow UI to handle mounting gracefully if offline or private without token
+      const entries = fs.readdirSync(TARGET_REPO_DIR);
+      if (entries.length > 0) {
+        autoMountState.error =
+          '持久化工作目录已存在非空文件但缺少 .git 元数据，为防止丢失本地内容已中止自动清空与重新克隆。';
+        return;
+      }
+      fs.rmdirSync(TARGET_REPO_DIR);
+    } catch (err) {
+      autoMountState.error = `检查持久化工作目录失败：${String(err)}`;
+      return;
     }
   }
+
+  autoMountState.inProgress = true;
+  autoMountState.error = null;
+  autoMountState.attemptedAt = Date.now();
+
+  try {
+    fs.mkdirSync(path.dirname(TARGET_REPO_DIR), { recursive: true });
+  } catch (err) {
+    autoMountState.inProgress = false;
+    autoMountState.error = `初始化目标仓库运行目录失败：${String(err)}`;
+    return;
+  }
+
+  const cleanUrl = `https://github.com/${cfg.repoSlug}.git`;
+  const cmdArgs = ['-c', 'core.quotePath=false', ...getGitAuthArgs(), 'clone', cleanUrl, TARGET_REPO_DIR];
+
+  execFile(
+    'git',
+    cmdArgs,
+    { cwd: path.dirname(TARGET_REPO_DIR), encoding: 'utf-8', maxBuffer: 32 * 1024 * 1024, timeout: 90_000 },
+    (err, _stdout, stderr) => {
+      autoMountState.inProgress = false;
+      if (err) {
+        const sanitized = String(stderr || err.message || err)
+          .replace(/AUTHORIZATION:\s*Basic\s+[A-Za-z0-9+/=]+/gi, 'AUTHORIZATION: Basic [REDACTED]')
+          .trim()
+          .split('\n')
+          .slice(-2)
+          .join(' ');
+        autoMountState.error = sanitized || '自动拉取仓库失败，请点击重新挂载。';
+      } else {
+        autoMountState.error = null;
+      }
+    }
+  );
 }
 
 async function startServer() {
@@ -755,8 +889,6 @@ async function startServer() {
   const PORT = 3000;
 
   app.use(express.json({ limit: '10mb' }));
-
-  autoMountFromEnvIfNeeded();
 
   // 1. Unified Repo Status API
   app.get('/api/repo-status', (_req, res) => {
@@ -767,7 +899,7 @@ async function startServer() {
     }
   });
 
-  // 2. Mount or Switch Target Repository (single workspace /tmp/target-repo)
+  // 2. Mount or Switch Target Repository (persistent workspace .workbench-data/target-repo)
   app.post('/api/repo/mount', (req, res) => {
     try {
       const rawSlug = String(req.body?.repoSlug || '')
@@ -798,12 +930,36 @@ async function startServer() {
         }
       }
 
+      const forceResetBrokenDir = Boolean(req.body?.forceResetBrokenDir);
       if (needFreshClone) {
-        if (fs.existsSync(TARGET_REPO_DIR)) {
+        if (isRepoCloned()) {
+          const currentStatus = getRepoStatusPayload();
+          const guard = canSafelyDeleteOrRecloneRepo({
+            hasRepo: true,
+            dirtyCount: currentStatus.dirtyCount,
+            aheadOfRemote: currentStatus.aheadOfRemote,
+            currentBranch: currentStatus.branch,
+            defaultBase: currentStatus.defaultBase,
+          });
+          if (!guard.allowed) {
+            res.status(409).json({ ok: false, error: guard.reason });
+            return;
+          }
+          fs.rmSync(TARGET_REPO_DIR, { recursive: true, force: true });
+        } else if (fs.existsSync(TARGET_REPO_DIR)) {
+          const entries = fs.readdirSync(TARGET_REPO_DIR);
+          if (entries.length > 0 && !forceResetBrokenDir) {
+            res.status(409).json({
+              ok: false,
+              error:
+                '目标仓库目录包含非空文件但缺少 .git 元数据，防丢失保护已阻止自动清空。如需强制重建，请传入 forceResetBrokenDir: true。',
+            });
+            return;
+          }
           fs.rmSync(TARGET_REPO_DIR, { recursive: true, force: true });
         }
         fs.mkdirSync(path.dirname(TARGET_REPO_DIR), { recursive: true });
-        runGit(['clone', cleanUrl, TARGET_REPO_DIR], { auth: true, cwd: '/tmp' });
+        runGit(['clone', cleanUrl, TARGET_REPO_DIR], { auth: true, cwd: path.dirname(TARGET_REPO_DIR) });
       } else {
         runGit(['remote', 'set-url', 'origin', cleanUrl]);
         runGit(['fetch', 'origin', '--prune'], { auth: true });
@@ -821,6 +977,8 @@ async function startServer() {
         }
       }
 
+      autoMountState.inProgress = false;
+      autoMountState.error = null;
       saveConfig({ repoSlug: rawSlug, defaultBase: effectiveBase });
       res.json(getRepoStatusPayload());
     } catch (err: unknown) {
@@ -835,25 +993,33 @@ async function startServer() {
     }
   });
 
-  // 3. Sync remote refs & optionally fast-forward base branch
-  app.post('/api/sync-github', (req, res) => {
+  // 3. Sync remote refs safely (NEVER overwrite dirty edits, unpushed commits, or active revision branches)
+  app.post('/api/sync-github', (_req, res) => {
     try {
       if (!isRepoCloned()) {
         res.status(400).json({ ok: false, error: '尚未挂载目标仓库，请先设置 owner/repo。' });
         return;
       }
       const cfg = loadConfig();
-      const force = Boolean(req.body?.force);
       runGit(['fetch', 'origin', '--prune'], { auth: true });
-      const dirty = runGit(['status', '--short']).trim();
-      if (!dirty || force) {
+      const statusBefore = getRepoStatusPayload();
+      const ffGuard = canSafelyFastForwardBase({
+        dirtyCount: statusBefore.dirtyCount,
+        aheadOfRemote: statusBefore.aheadOfRemote,
+        currentBranch: statusBefore.branch,
+        defaultBase: cfg.defaultBase,
+      });
+      if (ffGuard.allowed) {
         try {
-          runGit(['checkout', '-B', cfg.defaultBase, `origin/${cfg.defaultBase}`]);
+          runGit(['merge', '--ff-only', `origin/${cfg.defaultBase}`]);
         } catch {
-          // Keep current branch if defaultBase is absent
+          // Keep local branch untouched if non-fast-forward
         }
       }
-      res.json(getRepoStatusPayload());
+      res.json({
+        ...getRepoStatusPayload(),
+        syncNotice: ffGuard.allowed ? null : ffGuard.reason || null,
+      });
     } catch (err) {
       res.status(500).json({ ok: false, error: String(err) });
     }
@@ -902,6 +1068,381 @@ async function startServer() {
       res.json({ ok: true, pulls });
     } catch {
       res.json({ ok: true, pulls: [] });
+    }
+  });
+
+  // 4a. Read-only PR inspection (status, mergeability, check-runs, reviews, comments)
+  app.get('/api/repo/pr/:number', async (req, res) => {
+    try {
+      const prNum = Number(req.params.number);
+      if (!Number.isInteger(prNum) || prNum <= 0) {
+        res.status(400).json({ ok: false, error: '无效 PR 编号。' });
+        return;
+      }
+      const cfg = loadConfig();
+      const headers: Record<string, string> = {
+        Accept: 'application/vnd.github+json',
+        'User-Agent': 'manuscript-workbench',
+      };
+      const token = getGithubToken();
+      if (token) headers.Authorization = `Bearer ${token}`;
+
+      const prResp = await fetch(`https://api.github.com/repos/${cfg.repoSlug}/pulls/${prNum}`, { headers });
+      if (!prResp.ok) {
+        res.status(prResp.status).json({ ok: false, error: `GitHub API 错误: HTTP ${prResp.status}` });
+        return;
+      }
+      const pr = (await prResp.json()) as {
+        number: number;
+        title: string;
+        state: string;
+        draft?: boolean;
+        merged?: boolean;
+        mergeable?: boolean | null;
+        mergeable_state?: string;
+        html_url: string;
+        head?: { ref?: string; sha?: string };
+        base?: { ref?: string; sha?: string };
+        changed_files?: number;
+        additions?: number;
+        deletions?: number;
+        commits?: number;
+      };
+      const headSha = pr.head?.sha || '';
+
+      const [checksResp, reviewsResp, reviewCommentsResp, issueCommentsResp] = await Promise.all([
+        headSha
+          ? fetch(`https://api.github.com/repos/${cfg.repoSlug}/commits/${headSha}/check-runs?per_page=50`, { headers })
+          : Promise.resolve(null),
+        fetch(`https://api.github.com/repos/${cfg.repoSlug}/pulls/${prNum}/reviews?per_page=50`, { headers }),
+        fetch(`https://api.github.com/repos/${cfg.repoSlug}/pulls/${prNum}/comments?per_page=50`, { headers }),
+        fetch(`https://api.github.com/repos/${cfg.repoSlug}/issues/${prNum}/comments?per_page=50`, { headers }),
+      ]);
+
+      const checkRuns =
+        checksResp && checksResp.ok
+          ? (
+              ((await checksResp.json()) as {
+                check_runs?: Array<{
+                  name: string;
+                  status: string;
+                  conclusion: string | null;
+                  completed_at?: string;
+                  html_url?: string;
+                }>;
+              }).check_runs || []
+            ).map((c) => ({
+              name: c.name,
+              status: c.status,
+              conclusion: c.conclusion,
+              completedAt: c.completed_at || '',
+            }))
+          : [];
+
+      const reviews = reviewsResp.ok
+        ? (
+            (await reviewsResp.json()) as Array<{
+              user?: { login?: string };
+              state?: string;
+              commit_id?: string;
+              body?: string;
+              submitted_at?: string;
+            }>
+          ).map((rv) => ({
+            author: rv.user?.login || '',
+            state: rv.state || '',
+            commitId: (rv.commit_id || '').slice(0, 7),
+            body: (rv.body || '').slice(0, 800),
+            submittedAt: rv.submitted_at || '',
+          }))
+        : [];
+
+      const reviewComments = reviewCommentsResp.ok
+        ? (
+            (await reviewCommentsResp.json()) as Array<{
+              user?: { login?: string };
+              path?: string;
+              line?: number;
+              commit_id?: string;
+              original_commit_id?: string;
+              body?: string;
+              created_at?: string;
+            }>
+          ).map((cm) => ({
+            author: cm.user?.login || '',
+            path: cm.path || '',
+            line: cm.line || null,
+            commitId: (cm.commit_id || '').slice(0, 7),
+            originalCommitId: (cm.original_commit_id || '').slice(0, 7),
+            body: (cm.body || '').slice(0, 800),
+            createdAt: cm.created_at || '',
+          }))
+        : [];
+
+      const issueComments = issueCommentsResp.ok
+        ? (
+            (await issueCommentsResp.json()) as Array<{
+              user?: { login?: string };
+              body?: string;
+              created_at?: string;
+            }>
+          ).map((cm) => ({
+            author: cm.user?.login || '',
+            body: (cm.body || '').slice(0, 800),
+            createdAt: cm.created_at || '',
+          }))
+        : [];
+
+      res.json({
+        ok: true,
+        pr: {
+          number: pr.number,
+          title: pr.title,
+          state: pr.state,
+          draft: Boolean(pr.draft),
+          merged: Boolean(pr.merged),
+          mergeable: pr.mergeable,
+          mergeableState: pr.mergeable_state || '',
+          htmlUrl: pr.html_url,
+          headRef: pr.head?.ref || '',
+          headSha,
+          baseRef: pr.base?.ref || '',
+          baseSha: pr.base?.sha || '',
+          changedFiles: pr.changed_files || 0,
+          additions: pr.additions || 0,
+          deletions: pr.deletions || 0,
+          commits: pr.commits || 0,
+        },
+        checkRuns,
+        reviews,
+        reviewComments,
+        issueComments,
+      });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  // 4b. Push a clean non-main feature branch and open (or reuse) a GitHub Pull Request
+  app.post('/api/repo/push-pr', async (req, res) => {
+    try {
+      if (!isRepoCloned()) {
+        res.status(400).json({ ok: false, error: '尚未挂载目标仓库。' });
+        return;
+      }
+      const token = getGithubToken();
+      if (!token) {
+        res.status(400).json({ ok: false, error: '未配置 GITHUB_TOKEN，无法推送远端分支。' });
+        return;
+      }
+      const cfg = loadConfig();
+      const branch = runGit(['rev-parse', '--abbrev-ref', 'HEAD']).trim();
+      if (
+        !branch ||
+        branch === 'HEAD' ||
+        branch === 'main' ||
+        branch === 'master' ||
+        branch === cfg.defaultBase ||
+        !SAFE_REF_RE.test(branch)
+      ) {
+        res.status(400).json({ ok: false, error: `拒绝推送受保护分支或非法分支：${branch}` });
+        return;
+      }
+      const dirty = runGit(['status', '--short']).trim();
+      if (dirty) {
+        res.status(400).json({ ok: false, error: '当前工作区存在未提交改动，请先提交后再推送。' });
+        return;
+      }
+      const headSha = runGit(['rev-parse', 'HEAD']).trim();
+      runGit(['push', '-u', 'origin', branch], { auth: true });
+
+      const headers: Record<string, string> = {
+        Accept: 'application/vnd.github+json',
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+        'User-Agent': 'manuscript-workbench',
+      };
+      const owner = cfg.repoSlug.split('/')[0];
+      const existingResp = await fetch(
+        `https://api.github.com/repos/${cfg.repoSlug}/pulls?state=open&head=${encodeURIComponent(`${owner}:${branch}`)}`,
+        { headers }
+      );
+      const requestedTitle = String(req.body?.title || '').trim();
+      const requestedBody = typeof req.body?.body === 'string' ? req.body.body.trim() : '';
+      if (existingResp.ok) {
+        const existing = (await existingResp.json()) as Array<{ number: number; html_url: string }>;
+        if (existing.length > 0) {
+          let updated = false;
+          if (requestedTitle || requestedBody) {
+            const patchPayload: Record<string, string> = {};
+            if (requestedTitle) patchPayload.title = requestedTitle;
+            if (requestedBody) patchPayload.body = requestedBody;
+            const patchResp = await fetch(
+              `https://api.github.com/repos/${cfg.repoSlug}/pulls/${existing[0].number}`,
+              {
+                method: 'PATCH',
+                headers,
+                body: JSON.stringify(patchPayload),
+              }
+            );
+            updated = patchResp.ok;
+          }
+          res.json({
+            ok: true,
+            branch,
+            headSha,
+            prNumber: existing[0].number,
+            prUrl: existing[0].html_url,
+            created: false,
+            updated,
+          });
+          return;
+        }
+      }
+
+      const title = requestedTitle || `chore: ${branch}`;
+      const body = requestedBody;
+      const draft = Boolean(req.body?.draft);
+      const createResp = await fetch(`https://api.github.com/repos/${cfg.repoSlug}/pulls`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          title,
+          body,
+          head: branch,
+          base: cfg.defaultBase,
+          draft,
+        }),
+      });
+      if (!createResp.ok) {
+        const errText = await createResp.text();
+        res.status(createResp.status).json({ ok: false, error: `GitHub PR 创建失败: ${errText.slice(0, 300)}` });
+        return;
+      }
+      const createdPr = (await createResp.json()) as { number: number; html_url: string };
+      res.json({
+        ok: true,
+        branch,
+        headSha,
+        prNumber: createdPr.number,
+        prUrl: createdPr.html_url,
+        created: true,
+      });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  app.post('/api/repo/pr/:number/merge', async (req, res) => {
+    try {
+      const prNum = Number(req.params.number);
+      if (!Number.isInteger(prNum) || prNum <= 0) {
+        res.status(400).json({ ok: false, error: '无效的 PR 编号。' });
+        return;
+      }
+      const expectedSha = String(req.body?.sha || '').trim();
+      if (!/^[0-9a-f]{40}$/i.test(expectedSha)) {
+        res.status(400).json({ ok: false, error: '必须提供 40 位精确 head SHA 才能合并 PR。' });
+        return;
+      }
+      const mergeMethod = String(req.body?.mergeMethod || 'merge').trim();
+      if (!['merge', 'squash', 'rebase'].includes(mergeMethod)) {
+        res.status(400).json({ ok: false, error: '无效的 mergeMethod。' });
+        return;
+      }
+      const token = getGithubToken();
+      if (!token) {
+        res.status(400).json({ ok: false, error: '未配置 GITHUB_TOKEN，无法合并 PR。' });
+        return;
+      }
+      const cfg = loadConfig();
+      const headers: Record<string, string> = {
+        Accept: 'application/vnd.github+json',
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+        'User-Agent': 'manuscript-workbench',
+      };
+
+      // Verify exact head SHA and open state before merging
+      const prResp = await fetch(`https://api.github.com/repos/${cfg.repoSlug}/pulls/${prNum}`, { headers });
+      if (!prResp.ok) {
+        const errText = await prResp.text();
+        res.status(prResp.status).json({ ok: false, error: `读取 PR 失败: ${errText.slice(0, 300)}` });
+        return;
+      }
+      const prData = (await prResp.json()) as {
+        state: string;
+        mergeable: boolean | null;
+        head: { sha: string; ref: string };
+        base: { ref: string };
+      };
+      if (prData.state !== 'open') {
+        res.status(409).json({ ok: false, error: `PR #${prNum} 当前状态为 ${prData.state}，无法合并。` });
+        return;
+      }
+      if (prData.head.sha !== expectedSha) {
+        res.status(409).json({
+          ok: false,
+          error: `PR #${prNum} head SHA 已变化（期望 ${expectedSha}，实际 ${prData.head.sha}），拒绝合并。`,
+        });
+        return;
+      }
+
+      // Verify all check runs on exact head SHA succeeded
+      const checksResp = await fetch(
+        `https://api.github.com/repos/${cfg.repoSlug}/commits/${expectedSha}/check-runs`,
+        { headers }
+      );
+      if (!checksResp.ok) {
+        res.status(502).json({ ok: false, error: '无法验证 CI 检查状态，拒绝合并。' });
+        return;
+      }
+      const checksJson = (await checksResp.json()) as {
+        check_runs?: Array<{ name: string; status: string; conclusion: string | null }>;
+      };
+      const runs = checksJson.check_runs || [];
+      if (runs.length === 0) {
+        res.status(409).json({ ok: false, error: '精确 HEAD 上尚未找到 CI 检查记录，拒绝合并。' });
+        return;
+      }
+      const badRun = runs.find((r) => r.status !== 'completed' || r.conclusion !== 'success');
+      if (badRun) {
+        res.status(409).json({
+          ok: false,
+          error: `CI 检查未全部通过（${badRun.name}: status=${badRun.status}, conclusion=${badRun.conclusion}），拒绝合并。`,
+        });
+        return;
+      }
+
+      // Execute GitHub PR merge with sha lock
+      const mergeResp = await fetch(`https://api.github.com/repos/${cfg.repoSlug}/pulls/${prNum}/merge`, {
+        method: 'PUT',
+        headers,
+        body: JSON.stringify({
+          sha: expectedSha,
+          merge_method: mergeMethod,
+        }),
+      });
+      const mergeBody = (await mergeResp.json()) as { merged?: boolean; sha?: string; message?: string };
+      if (!mergeResp.ok || !mergeBody.merged) {
+        res.status(mergeResp.status).json({
+          ok: false,
+          error: `GitHub 合并失败: ${mergeBody.message || JSON.stringify(mergeBody).slice(0, 300)}`,
+        });
+        return;
+      }
+
+      res.json({
+        ok: true,
+        merged: true,
+        prNumber: prNum,
+        mergeSha: mergeBody.sha,
+        headRef: prData.head.ref,
+        baseRef: prData.base.ref,
+        message: mergeBody.message,
+      });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
     }
   });
 
@@ -1258,11 +1799,16 @@ async function startServer() {
         return;
       }
       const tracked = runGit(['ls-files']).split('\n').filter(Boolean);
-      const files = tracked
+      const untracked = runGit(['ls-files', '--others', '--exclude-standard'])
+        .split('\n')
+        .filter(Boolean);
+      const allPaths = Array.from(new Set([...tracked, ...untracked]));
+      const files = allPaths
         .filter((f) => !/\.(png|jpg|jpeg|gif|webp|pdf|zip|woff2?|ttf|ico)$/i.test(f))
         .map((rel) => {
           let group = '其他文件 (Other)';
           if (/\.(qmd|tex|md)$/i.test(rel)) group = '文稿与文档 (.qmd / .tex / .md)';
+          else if (/\.svg$/i.test(rel)) group = '矢量插图 (.svg)';
           else if (/\.bib$/i.test(rel)) group = '参考文献库 (.bib)';
           else if (/\.(ya?ml|json|toml|jsonc)$/i.test(rel)) group = '配置与清单 (.yml / .json)';
           else if (/\.(py|ts|tsx|js|mjs|sh)$/i.test(rel)) group = '脚本与代码 (Scripts)';
@@ -1345,6 +1891,7 @@ async function startServer() {
     const fullPath = safeResolveRepoPath(`publication/figures/${name}`);
     if (fullPath && fs.existsSync(fullPath) && fs.statSync(fullPath).isFile()) {
       res.setHeader('Content-Type', 'image/svg+xml; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-store');
       res.send(fs.readFileSync(fullPath, 'utf-8'));
     } else {
       res.status(404).send('SVG not found');
@@ -1417,7 +1964,7 @@ async function startServer() {
     }
   });
 
-  // 14. Review annotations & custom edits state persistence (stored in /tmp, never in git repo)
+  // 14. Review annotations & custom edits state persistence (stored in persistent .workbench-data)
   app.post('/api/sync-edits', (req, res) => {
     try {
       const scopeKey = String(req.body?.scopeKey || 'default');
@@ -1434,7 +1981,7 @@ async function startServer() {
         updatedAt,
         ...req.body,
       };
-      fs.writeFileSync(STATE_FILE, JSON.stringify(store, null, 2), 'utf-8');
+      atomicWriteFileSync(STATE_FILE, JSON.stringify(store, null, 2));
       res.json({ ok: true, updatedAt });
     } catch (err) {
       res.status(500).json({ ok: false, error: String(err) });
@@ -1488,6 +2035,7 @@ async function startServer() {
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`Manuscript Workbench server listening on http://localhost:${PORT}`);
+    autoMountFromEnvIfNeeded();
   });
 }
 

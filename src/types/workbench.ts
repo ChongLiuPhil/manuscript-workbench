@@ -90,6 +90,9 @@ export interface RepoStatus {
   hasLocalDraftEdits: boolean;
   dirtyCount: number;
   dirtyFiles: string[];
+  worktreeDigest?: string;
+  autoMounting?: boolean;
+  autoMountError?: string | null;
   recentCommits: string[];
   branches: string[];
   hasCustomDashboard: boolean;

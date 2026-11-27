@@ -64,13 +64,16 @@ import {
 import { ExportBriefModal } from './components/ExportBriefModal';
 import { UtilityDrawer, type UtilityDrawerMode } from './components/UtilityDrawer';
 import { RepoConfigModal } from './components/RepoConfigModal';
+import {
+  RenderedAcademicBlock,
+  FigurePreviewStrip,
+  extractFigureRefs,
+  splitAlignedMarkdownBlocks,
+} from './components/RenderedAcademicBlock';
+import { computeTokenDiff } from './utils/textDiff';
+import { buildRepoSignature, resolveTargetRef, shouldReloadRepoContext } from './utils/repoSync';
 
-type DiffOp = {
-  type: 'equal' | 'delete' | 'insert';
-  text: string;
-};
-
-type ViewMode = 'side-by-side' | 'inline' | 'clean-ai';
+type ViewMode = 'rendered' | 'side-by-side' | 'inline' | 'clean-ai';
 type FontSize = 'sm' | 'md' | 'lg';
 type StatusFilter = 'all' | ReviewStatus | 'modified';
 type CustomEditsMap = Record<string, { cn?: string; en?: string }>;
@@ -83,73 +86,6 @@ const DEFAULT_SCRATCH_BEFORE =
   '在此粘贴任意中文或英文学术段落（支持 $LaTeX$ 数学表达式），在右侧修改即可实时查看词元级高亮差异。';
 const DEFAULT_SCRATCH_AFTER =
   '在此粘贴任意中文或英文学术段落（支持 $LaTeX$ 数学公式），在右侧直接改写即可实时检视词元级高亮差异。';
-
-function tokenizeForDiff(text: string): string[] {
-  if (!text) return [];
-  const pattern =
-    /\$\$[\s\S]*?\$\$|\$[^$\n]+\$|\\operatorname\{[^}]+\}(?:\([^)]*\))?|\\mathcal\s+[A-Za-z]|\\[A-Za-z]+|\[\@[A-Za-z0-9_:-]+[^\]]*\]|[A-Za-z0-9_]+(?:'[A-Za-z]+)?|\s+|[\u4e00-\u9fff]|[^\sA-Za-z0-9_\u4e00-\u9fff]/g;
-  return text.match(pattern) ?? [text];
-}
-
-function computeTokenDiff(oldStr: string, newStr: string): DiffOp[] {
-  if (!oldStr && !newStr) return [];
-  if (!oldStr) return [{ type: 'insert', text: newStr }];
-  if (!newStr) return [{ type: 'delete', text: oldStr }];
-
-  const a = tokenizeForDiff(oldStr);
-  const b = tokenizeForDiff(newStr);
-  const n = a.length;
-  const m = b.length;
-
-  // Guard against extreme hunk size causing O(n*m) lag
-  if (n * m > 350000) {
-    return [
-      { type: 'delete', text: oldStr },
-      { type: 'insert', text: newStr },
-    ];
-  }
-
-  const dp: Uint16Array[] = Array.from({ length: n + 1 }, () => new Uint16Array(m + 1));
-  for (let i = n - 1; i >= 0; i--) {
-    for (let j = m - 1; j >= 0; j--) {
-      if (a[i] === b[j]) {
-        dp[i][j] = dp[i + 1][j + 1] + 1;
-      } else {
-        dp[i][j] = dp[i + 1][j] >= dp[i][j + 1] ? dp[i + 1][j] : dp[i][j + 1];
-      }
-    }
-  }
-
-  const raw: DiffOp[] = [];
-  let i = 0;
-  let j = 0;
-  while (i < n && j < m) {
-    if (a[i] === b[j]) {
-      raw.push({ type: 'equal', text: a[i] });
-      i++;
-      j++;
-    } else if (dp[i + 1][j] >= dp[i][j + 1]) {
-      raw.push({ type: 'delete', text: a[i] });
-      i++;
-    } else {
-      raw.push({ type: 'insert', text: b[j] });
-      j++;
-    }
-  }
-  while (i < n) raw.push({ type: 'delete', text: a[i++] });
-  while (j < m) raw.push({ type: 'insert', text: b[j++] });
-
-  const merged: DiffOp[] = [];
-  for (const op of raw) {
-    const last = merged[merged.length - 1];
-    if (last && last.type === op.type) {
-      last.text += op.text;
-    } else {
-      merged.push({ ...op });
-    }
-  }
-  return merged;
-}
 
 function HighlightedDiffBlock({
   oldText,
@@ -208,31 +144,42 @@ function HighlightedDiffBlock({
   }
 
   return (
-    <div className="grid grid-cols-1 xl:grid-cols-2 gap-3">
-      <div className="rounded border border-stone-200 bg-stone-50/80 p-3.5">
+    <div className="grid grid-cols-1 xl:grid-cols-2 gap-3" data-testid="side-by-side-diff">
+      <div
+        className="rounded border border-stone-200 bg-white p-3.5"
+        data-diff-pane="before"
+      >
         <div className="mb-2 flex items-center justify-between text-xs font-mono text-stone-500 border-b border-stone-200/80 pb-1">
           <span className="truncate">{baselineLabel}</span>
           <span className="text-rose-700 font-semibold shrink-0">[- 修订前]</span>
         </div>
-        <div className={`font-serif ${fontSizeClass} leading-relaxed text-stone-700 whitespace-pre-wrap`}>
+        <div className={`font-serif ${fontSizeClass} leading-relaxed text-stone-800 whitespace-pre-wrap`}>
           {ops.map((op, i) => {
             if (op.type === 'insert') return null;
             if (op.type === 'delete') {
               return (
                 <span
                   key={i}
-                  className="bg-rose-100/95 text-rose-900 line-through decoration-rose-500 px-0.5 font-medium"
+                  data-diff-op="delete"
+                  className="bg-rose-100/90 text-rose-950 rounded-xs px-0.5"
                 >
                   {op.text}
                 </span>
               );
             }
-            return <span key={i}>{op.text}</span>;
+            return (
+              <span key={i} data-diff-op="equal">
+                {op.text}
+              </span>
+            );
           })}
         </div>
       </div>
 
-      <div className="rounded border border-emerald-300/90 bg-emerald-50/20 p-3.5">
+      <div
+        className="rounded border border-emerald-200/90 bg-white p-3.5"
+        data-diff-pane="after"
+      >
         <div className="mb-2 flex items-center justify-between text-xs font-mono text-emerald-900 border-b border-emerald-200/80 pb-1">
           <span className="font-semibold truncate">{afterLabel}</span>
           <span className="text-emerald-700 font-semibold shrink-0">[+ 修订后]</span>
@@ -244,13 +191,18 @@ function HighlightedDiffBlock({
               return (
                 <span
                   key={i}
-                  className="bg-emerald-100/95 text-emerald-950 font-semibold px-0.5 border-b border-emerald-500"
+                  data-diff-op="insert"
+                  className="bg-emerald-100/90 text-emerald-950 rounded-xs px-0.5 border-b border-emerald-400/80"
                 >
                   {op.text}
                 </span>
               );
             }
-            return <span key={i}>{op.text}</span>;
+            return (
+              <span key={i} data-diff-op="equal">
+                {op.text}
+              </span>
+            );
           })}
         </div>
       </div>
@@ -281,6 +233,8 @@ export function App() {
 
   // Target repository & Git diff comparison state
   const [repoStatus, setRepoStatus] = useState<RepoStatus | null>(null);
+  const [repoLoading, setRepoLoading] = useState<boolean>(true);
+  const [repoFetchError, setRepoFetchError] = useState<string | null>(null);
   const [pulls, setPulls] = useState<PullRequestSummary[]>([]);
   const [mountingRepo, setMountingRepo] = useState<boolean>(false);
   const [mountError, setMountError] = useState<string | null>(null);
@@ -307,8 +261,8 @@ export function App() {
   const [expandedSections, setExpandedSections] = useState<Record<string, boolean>>({});
   const [showDiffOverview, setShowDiffOverview] = useState<boolean>(false);
   const [activeLang, setActiveLang] = useState<'zh' | 'en' | 'both'>('both');
-  const [viewMode, setViewMode] = useState<ViewMode>('side-by-side');
-  const [fontSize, setFontSize] = useState<FontSize>('sm');
+  const [viewMode, setViewMode] = useState<ViewMode>('rendered');
+  const [fontSize, setFontSize] = useState<FontSize>('md');
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
   const [globalEditOpen, setGlobalEditOpen] = useState<boolean>(false);
@@ -342,6 +296,7 @@ export function App() {
   const [volumeSearch, setVolumeSearch] = useState<string>('');
   const [jumpLineInput, setJumpLineInput] = useState<string>('');
   const [showVolumeToc, setShowVolumeToc] = useState<boolean>(true);
+  const [volumeRenderMode, setVolumeRenderMode] = useState<'rendered' | 'source'>('rendered');
   const [highlightedLine, setHighlightedLine] = useState<{ docId: string; lineNo: number } | null>(null);
   const [volumeSelection, setVolumeSelection] = useState<{
     docId: string;
@@ -548,7 +503,13 @@ export function App() {
           const nextSections = (d.sections || []) as DiffSection[];
           setDiffSections(nextSections);
           setCompareLabel(d.compareLabel || `${base} ... ${target}`);
-          setExpandedSections(nextSections.length > 0 ? { [nextSections[0].id]: true } : {});
+          if (nextSections.length > 0 && nextSections.length <= 5) {
+            const expanded: Record<string, boolean> = {};
+            for (const s of nextSections) expanded[s.id] = true;
+            setExpandedSections(expanded);
+          } else {
+            setExpandedSections(nextSections.length > 0 ? { [nextSections[0].id]: true } : {});
+          }
         } else {
           setDiffSections([]);
           setDiffError(d.error || '计算 Git 差异失败');
@@ -561,28 +522,37 @@ export function App() {
       .finally(() => setDiffLoading(false));
   }, []);
 
+  const lastRepoSigRef = useRef<string>('');
+
+  const applyClonedRepoContext = useCallback(
+    (d: RepoStatus, overrideBase?: string, overrideTarget?: string) => {
+      const nextBase = overrideBase || d.defaultBase || 'main';
+      const nextTarget = resolveTargetRef(d, nextBase, overrideTarget);
+      setBaseRef(nextBase);
+      setTargetRef(nextTarget);
+      loadDiff(nextBase, nextTarget);
+      loadFullVolume(d.repoSlug);
+      loadRepoFiles();
+      loadPulls();
+    },
+    [loadDiff, loadFullVolume, loadRepoFiles, loadPulls]
+  );
+
   const refreshRepoContext = useCallback(
     (overrideBase?: string, overrideTarget?: string) => {
       fetch('/api/repo-status')
-        .then((r) => r.json())
+        .then((r) => {
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          return r.json();
+        })
         .then((d: RepoStatus & { ok?: boolean }) => {
-          if (!d.ok) return;
+          if (!d.ok) throw new Error('Invalid repo-status payload');
+          setRepoFetchError(null);
+          setRepoLoading(false);
+          lastRepoSigRef.current = buildRepoSignature(d);
           setRepoStatus(d);
           if (d.cloned) {
-            const nextBase = overrideBase || d.defaultBase || 'main';
-            const nextTarget =
-              overrideTarget ||
-              (d.hasLocalDraftEdits
-                ? 'WORKING_TREE'
-                : d.branch && d.branch !== nextBase
-                ? d.branch
-                : 'WORKING_TREE');
-            setBaseRef(nextBase);
-            setTargetRef(nextTarget);
-            loadDiff(nextBase, nextTarget);
-            loadFullVolume(d.repoSlug);
-            loadRepoFiles();
-            loadPulls();
+            applyClonedRepoContext(d, overrideBase, overrideTarget);
           } else {
             setDiffSections([]);
             setVolumeDocs([]);
@@ -590,20 +560,72 @@ export function App() {
             setPulls([]);
           }
         })
-        .catch(() => {});
+        .catch(() => {
+          setRepoFetchError('正在等待本地工作台服务响应，将自动重试…');
+        });
     },
-    [loadDiff, loadFullVolume, loadRepoFiles, loadPulls]
+    [applyClonedRepoContext]
   );
 
   useEffect(() => {
     refreshRepoContext();
     fetch('/api/workflow-spec')
-      .then((r) => r.json())
+      .then((r) => (r.ok ? r.json() : null))
       .then((d) => {
-        if (d.ok && d.markdown) setWorkflowSpec(d.markdown);
+        if (d?.ok && d.markdown) setWorkflowSpec(d.markdown);
       })
       .catch(() => {});
   }, [refreshRepoContext]);
+
+  // Auto-detect initial recovery, background auto-mount completion, working-tree edits, or branch switches
+  const isWaitingForRepo =
+    repoLoading || Boolean(repoFetchError) || !repoStatus?.cloned || Boolean(repoStatus?.autoMounting);
+
+  useEffect(() => {
+    const checkRepoChanges = () => {
+      if (document.visibilityState === 'hidden') return;
+      fetch('/api/repo-status')
+        .then((r) => {
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          return r.json();
+        })
+        .then((d: RepoStatus & { ok?: boolean }) => {
+          if (!d.ok) return;
+          setRepoFetchError(null);
+          setRepoLoading(false);
+
+          if (!d.cloned) {
+            const nextSig = buildRepoSignature(d);
+            if (nextSig !== lastRepoSigRef.current) {
+              lastRepoSigRef.current = nextSig;
+              setRepoStatus(d);
+            }
+            return;
+          }
+
+          if (shouldReloadRepoContext(lastRepoSigRef.current, d)) {
+            lastRepoSigRef.current = buildRepoSignature(d);
+            setRepoStatus(d);
+            applyClonedRepoContext(d, d.defaultBase || baseRef || 'main');
+          }
+        })
+        .catch(() => {
+          if (!lastRepoSigRef.current) {
+            setRepoFetchError('正在等待本地工作台服务响应，将自动重试…');
+          }
+        });
+    };
+
+    const intervalMs = isWaitingForRepo ? 1500 : 4000;
+    const timer = window.setInterval(checkRepoChanges, intervalMs);
+    window.addEventListener('focus', checkRepoChanges);
+    document.addEventListener('visibilitychange', checkRepoChanges);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener('focus', checkRepoChanges);
+      document.removeEventListener('visibilitychange', checkRepoChanges);
+    };
+  }, [baseRef, isWaitingForRepo, applyClonedRepoContext]);
 
   const handleMountRepo = (repoSlug: string, defaultBase: string) => {
     setMountingRepo(true);
@@ -616,6 +638,7 @@ export function App() {
       .then((r) => r.json())
       .then((d) => {
         if (d.ok) {
+          lastRepoSigRef.current = buildRepoSignature(d);
           setRepoStatus(d);
           setShowRepoModal(false);
           const nextBase = d.defaultBase || defaultBase || 'main';
@@ -649,12 +672,17 @@ export function App() {
       .then((r) => r.json())
       .then((d) => {
         if (d.ok) {
+          lastRepoSigRef.current = buildRepoSignature(d);
           setRepoStatus(d);
-          loadDiff(baseRef, targetRef);
+          const nextBase = d.defaultBase || baseRef || 'main';
+          const nextTarget = d.hasLocalDraftEdits ? 'WORKING_TREE' : targetRef;
+          setBaseRef(nextBase);
+          setTargetRef(nextTarget);
+          loadDiff(nextBase, nextTarget);
           loadFullVolume(d.repoSlug);
           loadRepoFiles();
           loadPulls();
-          showToast('已拉取远端最新分支并刷新差异视图');
+          showToast(d.syncNotice || '已拉取远端最新分支并刷新差异视图');
         } else {
           showToast(d.error || '拉取同步失败');
         }
@@ -703,7 +731,7 @@ export function App() {
         if (d.ok) {
           setInspectorSha(d.sha256 || '');
           if (d.lint) setInspectorLint(d.lint);
-          showToast(`已保存 ${inspectorFile} 至 /tmp/target-repo`);
+          showToast(`已保存 ${inspectorFile} 至持久化本地工作区`);
           refreshRepoContext(baseRef, 'WORKING_TREE');
         } else {
           showToast(d.error || '保存失败');
@@ -1606,8 +1634,43 @@ export function App() {
           onCopy={handleCopy}
         />
 
+        {/* INITIAL LOADING / BACKGROUND AUTO-MOUNT STATE */}
+        {(repoLoading || repoStatus?.autoMounting) && !repoStatus?.cloned && (
+          <section
+            data-testid="repo-loading-state"
+            className="bg-white border border-stone-200/90 rounded p-8 sm:p-12 text-center space-y-4 max-w-3xl mx-auto"
+          >
+            <div className="inline-flex h-12 w-12 items-center justify-center rounded-lg border border-stone-200 bg-stone-50 text-stone-700 mx-auto">
+              <RefreshCw className="h-5 w-5 animate-spin" />
+            </div>
+            <div className="space-y-1.5">
+              <h2 className="text-base font-semibold text-stone-900">
+                {repoStatus?.autoMounting
+                  ? `正在后台自动拉取目标仓库 ${repoStatus.repoSlug || ''}…`
+                  : '正在连接工作台并自动加载文稿差异…'}
+              </h2>
+              <p className="text-xs text-stone-500 leading-relaxed max-w-md mx-auto">
+                {repoFetchError ||
+                  '工作区准备就绪后将自动载入，无需手动刷新页面。'}
+              </p>
+            </div>
+            {repoFetchError && (
+              <div className="pt-1">
+                <button
+                  type="button"
+                  onClick={() => refreshRepoContext()}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded border border-stone-300 bg-white hover:bg-stone-50 text-stone-800 text-xs font-medium"
+                >
+                  <RefreshCw className="h-3.5 w-3.5" />
+                  立即重试
+                </button>
+              </div>
+            )}
+          </section>
+        )}
+
         {/* UNMOUNTED STATE */}
-        {!repoStatus?.cloned && (
+        {!repoLoading && repoStatus && !repoStatus.cloned && !repoStatus.autoMounting && (
           <section className="bg-white border border-stone-200/90 rounded p-8 sm:p-12 text-center space-y-5 max-w-3xl mx-auto">
             <div className="inline-flex h-12 w-12 items-center justify-center rounded-lg border border-stone-200 bg-stone-50 text-stone-800 mx-auto">
               <GitBranch className="h-5 w-5" />
@@ -1617,12 +1680,17 @@ export function App() {
                 挂载任意学术文稿 GitHub 仓库开始研审
               </h2>
               <p className="text-sm text-stone-600 leading-relaxed max-w-xl mx-auto">
-                输入任意公开或授权访问的 <code className="font-mono text-stone-900">owner/repo</code>，系统将在单工作区{' '}
-                <code className="font-mono text-stone-900">/tmp/target-repo</code> 中自动识别中英文双语配对文稿（
+                输入任意公开或授权访问的 <code className="font-mono text-stone-900">owner/repo</code>，系统将在独立运行时工作区{' '}
+                <code className="font-mono text-stone-900">{repoStatus.repoDir || '<os.tmpdir>/manuscript-workbench-repo'}</code> 中自动识别中英文双语配对文稿（
                 <code className="font-mono">.qmd</code> / <code className="font-mono">.tex</code> /{' '}
                 <code className="font-mono">.md</code> / <code className="font-mono">.bib</code>
                 ），开启词元级 Diff 比对、AI 洁净读屏协作与合卷单章精读。
               </p>
+              {repoStatus.autoMountError && (
+                <p className="text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded px-3 py-2 max-w-xl mx-auto">
+                  自动挂载未完成：{repoStatus.autoMountError}
+                </p>
+              )}
             </div>
             <div className="flex flex-wrap items-center justify-center gap-2.5 pt-1">
               <button
@@ -1737,6 +1805,18 @@ export function App() {
               <div className="pt-2.5 border-t border-stone-100 flex flex-wrap items-center justify-between gap-2.5 text-xs">
                 <div className="flex flex-wrap items-center gap-2">
                   <div className="inline-flex rounded border border-stone-200 bg-stone-100 p-0.5">
+                    <button
+                      type="button"
+                      onClick={() => setViewMode('rendered')}
+                      className={`inline-flex items-center gap-1 px-2.5 py-1 rounded transition-colors whitespace-nowrap shrink-0 ${
+                        viewMode === 'rendered'
+                          ? 'bg-blue-700 text-white font-medium'
+                          : 'text-stone-700 hover:text-stone-900'
+                      }`}
+                    >
+                      <BookOpen className="h-3 w-3" />
+                      排版渲染
+                    </button>
                     <button
                       type="button"
                       onClick={() => setViewMode('side-by-side')}
@@ -2386,27 +2466,43 @@ export function App() {
                                         </div>
                                       )}
 
-                                      {isCleanAiMode ? (
-                                        <div
-                                          className={`rounded border border-stone-200 bg-white p-3.5 font-serif ${fontSizeClass} leading-relaxed text-stone-900 whitespace-pre-wrap`}
-                                        >
-                                          {currentCn}
+                                      {viewMode === 'rendered' ? (
+                                        <div className="rounded-lg border border-stone-200/90 bg-white px-5 py-4 shadow-2xs">
+                                          <RenderedAcademicBlock
+                                            content={currentCn}
+                                            fontSizeClass={fontSizeClass}
+                                          />
+                                        </div>
+                                      ) : isCleanAiMode ? (
+                                        <div className="space-y-2">
+                                          <div
+                                            className={`rounded border border-stone-200 bg-white p-3.5 font-serif ${fontSizeClass} leading-relaxed text-stone-900 whitespace-pre-wrap`}
+                                          >
+                                            {currentCn}
+                                          </div>
+                                          <FigurePreviewStrip figures={extractFigureRefs(currentCn)} />
                                         </div>
                                       ) : (
-                                        <HighlightedDiffBlock
-                                          oldText={pair.cnBefore}
-                                          newText={currentCn}
-                                          mode={viewMode}
-                                          baselineLabel={baseRef}
-                                          afterLabel={
-                                            modified
-                                              ? '工作台微调稿 (*)'
-                                              : targetRef === 'WORKING_TREE'
-                                              ? '当前工作区'
-                                              : targetRef
-                                          }
-                                          fontSizeClass={fontSizeClass}
-                                        />
+                                        <div className="space-y-2">
+                                          <HighlightedDiffBlock
+                                            oldText={pair.cnBefore}
+                                            newText={currentCn}
+                                            mode={viewMode}
+                                            baselineLabel={baseRef}
+                                            afterLabel={
+                                              modified
+                                                ? '工作台微调稿 (*)'
+                                                : targetRef === 'WORKING_TREE'
+                                                ? '当前工作区'
+                                                : targetRef
+                                            }
+                                            fontSizeClass={fontSizeClass}
+                                          />
+                                          <FigurePreviewStrip
+                                            figures={extractFigureRefs(currentCn)}
+                                            title="中文矢量插图实时渲染预览"
+                                          />
+                                        </div>
                                       )}
                                     </div>
                                   )}
@@ -2457,27 +2553,46 @@ export function App() {
                                         </div>
                                       )}
 
-                                      {isCleanAiMode ? (
-                                        <div
-                                          className={`rounded border border-stone-200 bg-white p-3.5 font-serif ${fontSizeClass} leading-relaxed text-stone-900 whitespace-pre-wrap`}
-                                        >
-                                          {currentEn}
+                                      {viewMode === 'rendered' ? (
+                                        <div className="rounded-lg border border-stone-200/90 bg-white px-5 py-4 shadow-2xs">
+                                          <RenderedAcademicBlock
+                                            content={currentEn}
+                                            fontSizeClass={fontSizeClass}
+                                          />
+                                        </div>
+                                      ) : isCleanAiMode ? (
+                                        <div className="space-y-2">
+                                          <div
+                                            className={`rounded border border-stone-200 bg-white p-3.5 font-serif ${fontSizeClass} leading-relaxed text-stone-900 whitespace-pre-wrap`}
+                                          >
+                                            {currentEn}
+                                          </div>
+                                          <FigurePreviewStrip
+                                            figures={extractFigureRefs(currentEn)}
+                                            title="English Vector Figure Preview"
+                                          />
                                         </div>
                                       ) : (
-                                        <HighlightedDiffBlock
-                                          oldText={pair.enBefore}
-                                          newText={currentEn}
-                                          mode={viewMode}
-                                          baselineLabel={baseRef}
-                                          afterLabel={
-                                            modified
-                                              ? 'Workbench Edited (*)'
-                                              : targetRef === 'WORKING_TREE'
-                                              ? 'Working Tree'
-                                              : targetRef
-                                          }
-                                          fontSizeClass={fontSizeClass}
-                                        />
+                                        <div className="space-y-2">
+                                          <HighlightedDiffBlock
+                                            oldText={pair.enBefore}
+                                            newText={currentEn}
+                                            mode={viewMode}
+                                            baselineLabel={baseRef}
+                                            afterLabel={
+                                              modified
+                                                ? 'Workbench Edited (*)'
+                                                : targetRef === 'WORKING_TREE'
+                                                ? 'Working Tree'
+                                                : targetRef
+                                            }
+                                            fontSizeClass={fontSizeClass}
+                                          />
+                                          <FigurePreviewStrip
+                                            figures={extractFigureRefs(currentEn)}
+                                            title="English Vector Figure Preview"
+                                          />
+                                        </div>
                                       )}
                                     </div>
                                   )}
@@ -2677,6 +2792,35 @@ export function App() {
                   </div>
 
                   <div className="flex flex-wrap items-center gap-2">
+                    <div
+                      role="group"
+                      aria-label="显示模式切换"
+                      className="inline-flex items-center rounded border border-stone-200 bg-stone-100 p-0.5 text-xs"
+                    >
+                      <button
+                        type="button"
+                        onClick={() => setVolumeRenderMode('rendered')}
+                        className={`px-2 py-1 rounded transition-colors whitespace-nowrap shrink-0 ${
+                          volumeRenderMode === 'rendered'
+                            ? 'bg-blue-700 text-white font-medium'
+                            : 'text-stone-700 hover:text-stone-900'
+                        }`}
+                      >
+                        排版渲染
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setVolumeRenderMode('source')}
+                        className={`px-2 py-1 rounded transition-colors whitespace-nowrap shrink-0 ${
+                          volumeRenderMode === 'source'
+                            ? 'bg-stone-900 text-white font-medium'
+                            : 'text-stone-700 hover:text-stone-900'
+                        }`}
+                      >
+                        行号源码
+                      </button>
+                    </div>
+
                     <div
                       role="group"
                       aria-label="阅读语种切换"
@@ -2946,83 +3090,135 @@ export function App() {
                           </div>
                         )}
 
-                        {effectiveLang === 'both' && (
-                          <div className="hidden xl:grid xl:grid-cols-2 gap-4 pl-20 pr-4 py-1.5 bg-stone-50 border-b border-stone-200 text-[11px] font-mono text-stone-500">
-                            <span>主稿 · {doc.path}</span>
-                            <span>译稿 · {doc.enPath}</span>
-                          </div>
-                        )}
-
-                        <div className="divide-y divide-stone-100/90">
-                          {Array.from({ length: rowCount }, (_, i) => {
-                            const lineNo = i + 1;
-                            const zhText = doc.lines[i] ?? '';
-                            const enText = doc.enLines[i] ?? '';
-                            const isSelected =
-                              volumeSelection?.docId === doc.id &&
-                              lineNo >= volumeSelection.startLine &&
-                              lineNo <= volumeSelection.endLine;
-                            const isHighlighted =
-                              highlightedLine?.docId === doc.id && highlightedLine.lineNo === lineNo;
-                            const isMatched =
-                              q.length > 0 &&
-                              (zhText.toLowerCase().includes(q) || enText.toLowerCase().includes(q));
-
-                            return (
-                              <div
-                                key={lineNo}
-                                id={`${doc.id}-L${lineNo}`}
-                                className={`flex items-start px-3 sm:px-4 py-1 transition-colors scroll-mt-28 ${
-                                  isSelected
-                                    ? 'bg-emerald-50/90'
-                                    : isHighlighted
-                                    ? 'bg-amber-100/80'
-                                    : isMatched
-                                    ? 'bg-amber-50/70'
-                                    : 'hover:bg-stone-50/80'
-                                }`}
-                              >
-                                <button
-                                  type="button"
-                                  onClick={(e) => handleLineNumberClick(doc.id, lineNo, e.shiftKey)}
-                                  title="点击选定行号区间以复制给 Gemini"
-                                  className={`w-14 shrink-0 select-none pr-3 text-right font-mono text-[11px] tabular-nums pt-0.5 ${
-                                    isSelected
-                                      ? 'text-emerald-800 font-bold'
-                                      : 'text-stone-400 hover:text-stone-800'
-                                  }`}
-                                >
-                                  L{lineNo}
-                                </button>
-
-                                {effectiveLang === 'both' ? (
-                                  <div
-                                    className={`flex-1 grid grid-cols-1 xl:grid-cols-2 gap-3 font-serif ${fontSizeClass} leading-relaxed text-stone-900 min-w-0`}
-                                  >
-                                    <div className="whitespace-pre-wrap break-words">
-                                      {zhText === '' ? '\u00A0' : zhText}
-                                    </div>
-                                    <div className="whitespace-pre-wrap break-words text-stone-700 xl:border-l xl:border-stone-200/70 xl:pl-3">
-                                      {enText === '' ? '\u00A0' : enText}
-                                    </div>
+                        {volumeRenderMode === 'rendered' ? (
+                          <div className="px-5 sm:px-8 py-6 bg-white">
+                            {effectiveLang === 'both' ? (
+                              (() => {
+                                const zhBlocks = splitAlignedMarkdownBlocks(doc.lines.join('\n'));
+                                const enBlocks = splitAlignedMarkdownBlocks(doc.enLines.join('\n'));
+                                const maxLen = Math.max(zhBlocks.length, enBlocks.length);
+                                return (
+                                  <div className="divide-y divide-stone-100">
+                                    {Array.from({ length: maxLen }, (_, bIdx) => (
+                                      <div
+                                        key={bIdx}
+                                        className="grid grid-cols-1 xl:grid-cols-2 gap-6 py-2.5 first:pt-0"
+                                      >
+                                        <div className="min-w-0">
+                                          {zhBlocks[bIdx] ? (
+                                            <RenderedAcademicBlock
+                                              content={zhBlocks[bIdx]}
+                                              fontSizeClass={fontSizeClass}
+                                            />
+                                          ) : null}
+                                        </div>
+                                        <div className="min-w-0 xl:border-l xl:border-stone-200/70 xl:pl-6">
+                                          {enBlocks[bIdx] ? (
+                                            <RenderedAcademicBlock
+                                              content={enBlocks[bIdx]}
+                                              fontSizeClass={fontSizeClass}
+                                            />
+                                          ) : null}
+                                        </div>
+                                      </div>
+                                    ))}
                                   </div>
-                                ) : (
-                                  <div
-                                    className={`flex-1 font-serif ${fontSizeClass} leading-relaxed text-stone-900 whitespace-pre-wrap break-words min-w-0`}
-                                  >
-                                    {effectiveLang === 'en'
-                                      ? enText === ''
-                                        ? '\u00A0'
-                                        : enText
-                                      : zhText === ''
-                                      ? '\u00A0'
-                                      : zhText}
-                                  </div>
-                                )}
+                                );
+                              })()
+                            ) : (
+                              <div className="max-w-4xl mx-auto">
+                                <RenderedAcademicBlock
+                                  content={
+                                    effectiveLang === 'en'
+                                      ? doc.enLines.join('\n')
+                                      : doc.lines.join('\n')
+                                  }
+                                  fontSizeClass={fontSizeClass}
+                                />
                               </div>
-                            );
-                          })}
-                        </div>
+                            )}
+                          </div>
+                        ) : (
+                          <>
+                            {effectiveLang === 'both' && (
+                              <div className="hidden xl:grid xl:grid-cols-2 gap-4 pl-20 pr-4 py-1.5 bg-stone-50 border-b border-stone-200 text-[11px] font-mono text-stone-500">
+                                <span>主稿 · {doc.path}</span>
+                                <span>译稿 · {doc.enPath}</span>
+                              </div>
+                            )}
+
+                            <div className="divide-y divide-stone-100/90">
+                              {Array.from({ length: rowCount }, (_, i) => {
+                                const lineNo = i + 1;
+                                const zhText = doc.lines[i] ?? '';
+                                const enText = doc.enLines[i] ?? '';
+                                const isSelected =
+                                  volumeSelection?.docId === doc.id &&
+                                  lineNo >= volumeSelection.startLine &&
+                                  lineNo <= volumeSelection.endLine;
+                                const isHighlighted =
+                                  highlightedLine?.docId === doc.id && highlightedLine.lineNo === lineNo;
+                                const isMatched =
+                                  q.length > 0 &&
+                                  (zhText.toLowerCase().includes(q) || enText.toLowerCase().includes(q));
+
+                                return (
+                                  <div
+                                    key={lineNo}
+                                    id={`${doc.id}-L${lineNo}`}
+                                    className={`flex items-start px-3 sm:px-4 py-1 transition-colors scroll-mt-28 ${
+                                      isSelected
+                                        ? 'bg-emerald-50/90'
+                                        : isHighlighted
+                                        ? 'bg-amber-100/80'
+                                        : isMatched
+                                        ? 'bg-amber-50/70'
+                                        : 'hover:bg-stone-50/80'
+                                    }`}
+                                  >
+                                    <button
+                                      type="button"
+                                      onClick={(e) => handleLineNumberClick(doc.id, lineNo, e.shiftKey)}
+                                      title="点击选定行号区间以复制给 Gemini"
+                                      className={`w-14 shrink-0 select-none pr-3 text-right font-mono text-[11px] tabular-nums pt-0.5 ${
+                                        isSelected
+                                          ? 'text-emerald-800 font-bold'
+                                          : 'text-stone-400 hover:text-stone-800'
+                                      }`}
+                                    >
+                                      L{lineNo}
+                                    </button>
+
+                                    {effectiveLang === 'both' ? (
+                                      <div
+                                        className={`flex-1 grid grid-cols-1 xl:grid-cols-2 gap-3 font-serif ${fontSizeClass} leading-relaxed text-stone-900 min-w-0`}
+                                      >
+                                        <div className="whitespace-pre-wrap break-words">
+                                          {zhText === '' ? '\u00A0' : zhText}
+                                        </div>
+                                        <div className="whitespace-pre-wrap break-words text-stone-700 xl:border-l xl:border-stone-200/70 xl:pl-3">
+                                          {enText === '' ? '\u00A0' : enText}
+                                        </div>
+                                      </div>
+                                    ) : (
+                                      <div
+                                        className={`flex-1 font-serif ${fontSizeClass} leading-relaxed text-stone-900 whitespace-pre-wrap break-words min-w-0`}
+                                      >
+                                        {effectiveLang === 'en'
+                                          ? enText === ''
+                                            ? '\u00A0'
+                                            : enText
+                                          : zhText === ''
+                                          ? '\u00A0'
+                                          : zhText}
+                                      </div>
+                                    )}
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </>
+                        )}
                       </article>
                     );
                   })}
@@ -3256,8 +3452,21 @@ export function App() {
                     正在读取 {inspectorFile} ...
                   </div>
                 ) : inspectorViewMode === 'read' ? (
-                  <div className="rounded border border-stone-200 bg-white overflow-x-auto max-h-[70vh] overflow-y-auto">
-                    <div className="divide-y divide-stone-100 font-mono text-xs">
+                  <div className="space-y-4">
+                    {inspectorFile.toLowerCase().endsWith('.svg') && (
+                      <FigurePreviewStrip
+                        figures={[
+                          {
+                            caption: '',
+                            rawPath: inspectorFile,
+                            fileName: inspectorFile.split('/').pop() || inspectorFile,
+                          },
+                        ]}
+                        title={`矢量图实时渲染预览 · ${inspectorFile}`}
+                      />
+                    )}
+                    <div className="rounded border border-stone-200 bg-white overflow-x-auto max-h-[70vh] overflow-y-auto">
+                      <div className="divide-y divide-stone-100 font-mono text-xs">
                       {rawLines.map((line, i) => {
                         const lineNo = i + 1;
                         const matched = iq ? line.toLowerCase().includes(iq) : false;
@@ -3277,12 +3486,13 @@ export function App() {
                           </div>
                         );
                       })}
+                      </div>
                     </div>
                   </div>
                 ) : (
                   <div className="space-y-1.5">
                     <div className="text-xs text-stone-500">
-                      源码编辑器（修改后点击「保存至工作区」将直接写入 `/tmp/target-repo` 并在词元比对页生成实时 Diff）：
+                      源码编辑器（修改后点击「保存至工作区」将直接写入持久化本地工作区并在词元比对页生成实时 Diff）：
                     </div>
                     <textarea
                       value={inspectorContent}

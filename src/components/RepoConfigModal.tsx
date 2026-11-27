@@ -81,8 +81,8 @@ export function RepoConfigModal({
               className="w-full rounded border border-stone-300 bg-white px-3 py-2 font-mono text-xs text-stone-900 placeholder-stone-400 focus:border-stone-900 focus:outline-none"
             />
             <p className="text-stone-500 leading-relaxed">
-              支持直接输入 <code className="font-mono">owner/repo</code> 或粘贴 GitHub 仓库地址。克隆与所有读写操作统一在本地单工作区{' '}
-              <code className="font-mono">/tmp/target-repo</code> 中进行。
+              支持直接输入 <code className="font-mono">owner/repo</code> 或粘贴 GitHub 仓库地址。克隆与所有读写操作统一在独立运行时目录（默认系统临时目录下的{' '}
+              <code className="font-mono">manuscript-workbench-repo</code>，可通过 <code className="font-mono">WORKBENCH_REPO_DIR</code> 自定义）中进行，并在存在未提交或未推送修改时自动拦截清空操作。
             </p>
           </div>
 
