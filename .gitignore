@@ -5,6 +5,7 @@ coverage/
 .env
 .env.*
 !.env.example
+.workbench-data/
 workbench/
 workbench-synced-edits.json
 .local-repo-drafts/

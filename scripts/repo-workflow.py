@@ -2,7 +2,8 @@
 """
 Generic Local-Repo-First Git Workflow CLI for Manuscript Workbench.
 
-Operates strictly on a single local clone directory (default: /tmp/target-repo)
+Operates strictly on a single local clone directory
+(default: <os.tmpdir>/manuscript-workbench-repo, overrideable via WORKBENCH_REPO_DIR)
 and reads optional GITHUB_REPO and GITHUB_TOKEN strictly from runtime environment
 variables without ever persisting tokens into .git/config or repository files.
 """
@@ -16,9 +17,13 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
-DEFAULT_REPO_DIR = Path("/tmp/target-repo")
+DEFAULT_REPO_DIR = Path(
+    (os.environ.get("WORKBENCH_REPO_DIR") or "").strip()
+    or os.path.join(tempfile.gettempdir(), "manuscript-workbench-repo")
+)
 DEFAULT_BASE_BRANCH = "main"
 REPO_SLUG_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
